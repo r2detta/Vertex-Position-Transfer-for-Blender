@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Vertex Position Transfer",
     "author": "r2detta",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (4, 3, 0),
     "location": "View3D > Tools > Vertex Position Transfer",
     "description": "Transfer vertex positions between meshes based on vertex indices",
@@ -21,19 +21,7 @@ class MESH_OT_transfer_vertex_positions(Operator):
     bl_label = "Transfer Vertex Positions"
     bl_options = {'REGISTER', 'UNDO'}
     
-    blend_factor: FloatProperty(
-        name="Blend Factor",
-        description="Blend factor between original and transferred positions",
-        default=1.0,
-        min=0.0,
-        max=1.0,
-    )
-    
-    transfer_to_active_shapekey: BoolProperty(
-        name="Transfer to Active Shapekey",
-        description="Transfer to active shapekey if target has shapekeys",
-        default=True,
-    )
+
     
     def get_final_vertex_positions(self, obj):
         """Tüm aktif shapekey'lerin etkisini hesaba katarak final vertex pozisyonlarını döndürür"""
@@ -69,6 +57,72 @@ class MESH_OT_transfer_vertex_positions(Operator):
             self.report({'ERROR'}, "Both source and target must be mesh objects!")
             return {'CANCELLED'}
         
+        # Gizli object'lerle çalışabilmek için view layer'da görünürlüğü kontrol et
+        if source_obj.hide_viewport:
+            self.report({'WARNING'}, "Source object is hidden in viewport, but transfer will still work.")
+        
+        if target_obj.hide_viewport:
+            self.report({'WARNING'}, "Target object is hidden in viewport, but transfer will still work.")
+        
+        # Panel'deki property'leri al
+        blend_factor = vertex_transfer_props.blend_factor
+        transfer_to_active_shapekey = vertex_transfer_props.transfer_to_active_shapekey
+        only_selected_vertices = vertex_transfer_props.only_selected_vertices
+        
+        # Seçili vertexleri kontrol et
+        selected_vertices = set()
+        if only_selected_vertices:
+            # Gizli object'lerle çalışmak için daha güvenli yöntem
+            source_was_hidden = source_obj.hide_viewport
+            
+            # Önce object modunda seçili vertexleri kontrol et
+            try:
+                bm = bmesh.new()
+                bm.from_mesh(source_obj.data)
+                bm.verts.ensure_lookup_table()
+                selected_vertices = {v.index for v in bm.verts if v.select}
+                bm.free()
+                
+                if not selected_vertices:
+                    # Eğer object modunda seçili vertex yoksa, edit moduna geçmeyi dene
+                    if not source_was_hidden:
+                        # Sadece görünür object'ler için edit moduna geç
+                        original_active = context.view_layer.objects.active
+                        original_mode = context.mode
+                        
+                        context.view_layer.objects.active = source_obj
+                        
+                        if context.mode != 'EDIT_MESH':
+                            bpy.ops.object.mode_set(mode='EDIT')
+                        
+                        # Edit modunda seçili vertexleri al
+                        try:
+                            bm = bmesh.from_edit_mesh(source_obj.data)
+                            bm.verts.ensure_lookup_table()
+                            selected_vertices = {v.index for v in bm.verts if v.select}
+                            bm.free()
+                        except Exception as e:
+                            self.report({'WARNING'}, f"Could not read selected vertices: {str(e)}")
+                            selected_vertices = set()
+                        
+                        # Orijinal duruma geri dön
+                        context.view_layer.objects.active = original_active
+                        if original_mode != 'EDIT_MESH':
+                            bpy.ops.object.mode_set(mode=original_mode)
+                    else:
+                        self.report({'WARNING'}, "Source object is hidden. Cannot read selected vertices in edit mode.")
+                        return {'CANCELLED'}
+                
+            except Exception as e:
+                self.report({'ERROR'}, f"Error reading selected vertices: {str(e)}")
+                return {'CANCELLED'}
+            
+            if not selected_vertices:
+                self.report({'WARNING'}, "No vertices selected in source object!")
+                return {'CANCELLED'}
+            
+            self.report({'INFO'}, f"Found {len(selected_vertices)} selected vertices in source object.")
+        
         original_active = context.view_layer.objects.active
         original_mode = context.mode
         
@@ -86,30 +140,35 @@ class MESH_OT_transfer_vertex_positions(Operator):
             
             successful_transfers = 0
             
-            if target_obj.data.shape_keys and self.transfer_to_active_shapekey:
+            if target_obj.data.shape_keys and transfer_to_active_shapekey:
                 active_key_index = target_obj.active_shape_key_index
                 if active_key_index >= 0:
                     active_key = target_obj.data.shape_keys.key_blocks[active_key_index]
                     
                     for i, v in enumerate(active_key.data):
                         if i < len(source_positions):
-                            world_co = source_obj.matrix_world @ source_positions[i]
-                            local_co = target_obj.matrix_world.inverted() @ world_co
-                            
-                            if self.blend_factor < 1.0:
-                                blended_co = v.co.lerp(local_co, self.blend_factor)
-                                v.co = blended_co
-                            else:
-                                v.co = local_co
-                            
-                            successful_transfers += 1
+                            # Sadece seçili vertexleri transfer et
+                            if not only_selected_vertices or i in selected_vertices:
+                                world_co = source_obj.matrix_world @ source_positions[i]
+                                local_co = target_obj.matrix_world.inverted() @ world_co
+                                
+                                if blend_factor < 1.0:
+                                    blended_co = v.co.lerp(local_co, blend_factor)
+                                    v.co = blended_co
+                                else:
+                                    v.co = local_co
+                                
+                                successful_transfers += 1
                     
-                    self.report({'INFO'}, f"Transferred to shapekey '{active_key.name}': {successful_transfers} vertices.")
+                    if only_selected_vertices:
+                        self.report({'INFO'}, f"Transferred {len(selected_vertices)} selected vertices to shapekey '{active_key.name}'.")
+                    else:
+                        self.report({'INFO'}, f"Transferred to shapekey '{active_key.name}': {successful_transfers} vertices.")
                 else:
                     self.report({'WARNING'}, "No active shapekey found on target, transferring to base mesh.")
-                    self.transfer_to_base_mesh(target_obj, source_obj, source_positions)
+                    self.transfer_to_base_mesh(target_obj, source_obj, source_positions, selected_vertices, blend_factor, only_selected_vertices)
             else:
-                self.transfer_to_base_mesh(target_obj, source_obj, source_positions)
+                self.transfer_to_base_mesh(target_obj, source_obj, source_positions, selected_vertices, blend_factor, only_selected_vertices)
             
             target_mesh.update()
             
@@ -128,25 +187,30 @@ class MESH_OT_transfer_vertex_positions(Operator):
             if original_mode == 'EDIT_MESH':
                 bpy.ops.object.mode_set(mode='EDIT')
     
-    def transfer_to_base_mesh(self, target_obj, source_obj, source_positions):
+    def transfer_to_base_mesh(self, target_obj, source_obj, source_positions, selected_vertices, blend_factor, only_selected_vertices):
         """Temel mesh vertexlerine pozisyon transfer et"""
         target_mesh = target_obj.data
         successful_transfers = 0
         
         for i, v in enumerate(target_mesh.vertices):
             if i < len(source_positions):
-                world_co = source_obj.matrix_world @ source_positions[i]
-                local_co = target_obj.matrix_world.inverted() @ world_co
-                
-                if self.blend_factor < 1.0:
-                    blended_co = v.co.lerp(local_co, self.blend_factor)
-                    v.co = blended_co
-                else:
-                    v.co = local_co
-                
-                successful_transfers += 1
+                # Sadece seçili vertexleri transfer et
+                if not only_selected_vertices or i in selected_vertices:
+                    world_co = source_obj.matrix_world @ source_positions[i]
+                    local_co = target_obj.matrix_world.inverted() @ world_co
+                    
+                    if blend_factor < 1.0:
+                        blended_co = v.co.lerp(local_co, blend_factor)
+                        v.co = blended_co
+                    else:
+                        v.co = local_co
+                    
+                    successful_transfers += 1
         
-        self.report({'INFO'}, f"Transferred to base mesh: {successful_transfers} vertices.")
+        if only_selected_vertices:
+            self.report({'INFO'}, f"Transferred {len(selected_vertices)} selected vertices to base mesh.")
+        else:
+            self.report({'INFO'}, f"Transferred to base mesh: {successful_transfers} vertices.")
 
 class MESH_OT_check_vertex_counts(Operator):
     """Check vertex count compatibility between source and target objects"""
@@ -195,12 +259,17 @@ class MESH_PT_vertex_transfer(Panel):
     
     @classmethod
     def poll(cls, context):
-        return context.mode in {'OBJECT', 'EDIT_MESH'} and context.active_object is not None
+        return context.mode in {'OBJECT', 'EDIT_MESH'}
     
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        vertex_transfer_props = scene.vertex_transfer_props
+        
+        try:
+            vertex_transfer_props = scene.vertex_transfer_props
+        except:
+            layout.label(text="Error: Properties not found")
+            return
         
         layout.label(text="Select Objects:")
         col = layout.column()
@@ -210,9 +279,18 @@ class MESH_PT_vertex_transfer(Panel):
         box = layout.box()
         box.label(text="Transfer Settings:")
         
-        op = box.operator("mesh.transfer_vertex_positions")
-        box.prop(op, "blend_factor", slider=True)
-        box.prop(op, "transfer_to_active_shapekey")
+        # Properties'leri panel'den al
+        row = box.row()
+        row.prop(vertex_transfer_props, "blend_factor", slider=True)
+        
+        row = box.row()
+        row.prop(vertex_transfer_props, "transfer_to_active_shapekey")
+        
+        row = box.row()
+        row.prop(vertex_transfer_props, "only_selected_vertices")
+        
+        # Transfer butonu
+        box.operator("mesh.transfer_vertex_positions", text="Transfer Vertex Positions")
         
         layout.operator("mesh.check_vertex_counts", icon='CHECKMARK')
         
@@ -257,6 +335,26 @@ class VertexTransferProperties(bpy.types.PropertyGroup):
         description="Object to transfer vertex positions to",
         type=bpy.types.Object,
         poll=lambda self, obj: obj and obj.type == 'MESH'
+    )
+    
+    blend_factor: FloatProperty(
+        name="Blend Factor",
+        description="Blend factor between original and transferred positions",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+    )
+    
+    transfer_to_active_shapekey: BoolProperty(
+        name="Transfer to Active Shapekey",
+        description="Transfer to active shapekey if target has shapekeys",
+        default=True,
+    )
+    
+    only_selected_vertices: BoolProperty(
+        name="Only Selected Vertices",
+        description="Only transfer positions for selected vertices",
+        default=False,
     )
 
 class MESH_OT_create_transfer_shapekey(Operator):
@@ -323,6 +421,12 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.vertex_transfer_props = PointerProperty(type=VertexTransferProperties)
+    
+    # UI'yi zorla güncelle
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            area.tag_redraw()
+    
     print("Vertex Position Transfer addon registered successfully!")
 
 def unregister():
